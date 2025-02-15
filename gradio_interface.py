@@ -2,6 +2,7 @@ import gradio as gr
 from dotenv import load_dotenv
 from coinbase_agent import handle_user_input, initialize_agent
 import logging
+import time
 
 # Load environment variables
 load_dotenv()
@@ -27,16 +28,20 @@ def chat_with_agent(message, history):
         # Process the user input through the agent
         response = handle_user_input(AGENT_EXECUTOR, message)
         logger.info(f"Got response: {response}")
-        return response
+        
+        # Stream the response character by character with a slight delay
+        for i in range(len(response)):
+            time.sleep(0.01)  # Add a small delay for better readability
+            yield response[:i+1]
     except Exception as e:
         logger.error(f"Error in chat: {str(e)}", exc_info=True)
-        return f"Error: {str(e)}"
+        yield f"Error: {str(e)}"
 
 # Create Gradio interface
 demo = gr.ChatInterface(
     fn=chat_with_agent,
-    title="Coinbase Agent Chat Interface",
-    description="""Chat with the Coinbase agent to manage your account and perform transactions.
+    title="Base Blockchain AI Agent",
+    description="""Chat with the Base Blockchain AI Agent to manage your account and perform transactions.
 
 Example commands:
 • Create a new wallet
@@ -57,7 +62,7 @@ Example commands:
 if __name__ == "__main__":
     logger.info("Starting Gradio interface...")
     demo.launch(
-        server_name="0.0.0.0",  # Make accessible from other devices
-        share=False,  # Set to True to create a public link
+        server_name="127.0.0.1",  # Use localhost instead of 0.0.0.0
+        share=False,  # Disable sharing
         show_api=False
     ) 
