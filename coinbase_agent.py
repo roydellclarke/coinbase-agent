@@ -3,7 +3,7 @@ import os
 import sys
 import time
 import logging
-from typing import TypedDict, Annotated, List, Dict, Any, Optional
+from typing import TypedDict, Annotated, List, Dict, Any, Optional, Tuple
 from operator import add
 from dotenv import load_dotenv
 
@@ -29,6 +29,7 @@ wallet_data_file = "wallet_data.txt"
 MAX_ITERATIONS = 3
 TIMEOUT = 15
 REQUEST_TIMEOUT = 20
+TRANSACTION_THRESHOLD = 1000  # Threshold in USD for transactions requiring human approval
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -106,9 +107,96 @@ AGENT_EXECUTOR, AGENT_CONFIG, CDP_TOOLS = initialize_agent()
 # ---------------- Agent State Definition ----------------
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add]   # Conversation history (accumulated)
-    next_action: Optional[str]                    # Either "tools" or "end"
+    next_action: Optional[str]                    # Either "tools", "human_approval", or "end"
     tool_calls: Optional[List[Dict[str, Any]]]    # Structured tool call instructions (if any)
     iterations: int                               # Iteration counter to avoid infinite loops
+    requires_approval: bool                        # Whether the current action needs human approval
+    transaction_amount: Optional[float]            # Amount involved in the transaction
+    transaction_details: Optional[Dict[str, Any]]  # Details of the transaction for human review
+
+def requires_human_approval(tool_calls: List[Dict[str, Any]]) -> Tuple[bool, Optional[float], Optional[Dict[str, Any]]]:
+    """
+    Check if the tool calls contain transactions that require human approval.
+    Returns (requires_approval, amount, details)
+    """
+    if not tool_calls:
+        return False, None, None
+        
+    for call in tool_calls:
+        try:
+            # Check for transaction-related tools
+            if "send" in call["tool"].lower() or "trade" in call["tool"].lower():
+                input_data = call["input"]
+                if isinstance(input_data, str):
+                    input_data = json.loads(input_data)
+                
+                # Extract amount from transaction
+                amount = float(input_data.get("amount", 0))
+                
+                if amount >= TRANSACTION_THRESHOLD:
+                    return True, amount, {
+                        "tool": call["tool"],
+                        "amount": amount,
+                        "details": input_data
+                    }
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            logger.warning(f"Error parsing tool call for approval check: {e}")
+            continue
+            
+    return False, None, None
+
+# ---------------- Human Approval Node ----------------
+def human_approval_node(state: AgentState) -> AgentState:
+    """
+    Node for handling human approval of high-value transactions.
+    """
+    if not state.get("requires_approval", False):
+        return state
+
+    amount = state.get("transaction_amount", 0)
+    details = state.get("transaction_details", {})
+    
+    # Format transaction details for human review
+    approval_message = (
+        f"\n🚨 TRANSACTION APPROVAL REQUIRED 🚨\n"
+        f"Transaction amount: ${amount:,.2f} exceeds threshold (${TRANSACTION_THRESHOLD:,.2f})\n"
+        f"Transaction type: {details.get('tool', 'Unknown')}\n"
+        f"Details: {json.dumps(details.get('details', {}), indent=2)}\n"
+        f"\nDo you approve this transaction? (yes/no): "
+    )
+    
+    try:
+        # Print approval request and get user input
+        print(approval_message)
+        user_input = input().strip().lower()
+        
+        if user_input == 'yes':
+            # User approved - proceed with the transaction
+            return {
+                **state,
+                "next_action": "tools",
+                "requires_approval": False
+            }
+        else:
+            # User rejected - add rejection message and end
+            rejection_message = AIMessage(content="Transaction cancelled due to user rejection.")
+            return {
+                **state,
+                "messages": [rejection_message],
+                "next_action": "end",
+                "requires_approval": False,
+                "tool_calls": None
+            }
+    except Exception as e:
+        logger.error(f"Error in human approval process: {e}")
+        error_message = AIMessage(content="Error in transaction approval process. Transaction cancelled.")
+        return {
+            **state,
+            "messages": [error_message],
+            "next_action": "end",
+            "requires_approval": False,
+            "tool_calls": None
+        }
 
 # ---------------- Reasoner Node ----------------
 def reasoner(state: AgentState) -> AgentState:
@@ -127,7 +215,10 @@ def reasoner(state: AgentState) -> AgentState:
             "messages": [termination_message],
             "next_action": "end",
             "tool_calls": None,
-            "iterations": iterations
+            "iterations": iterations,
+            "requires_approval": False,
+            "transaction_amount": None,
+            "transaction_details": None
         }
     state["iterations"] = iterations
     logger.info(f"Reasoner iteration {iterations} with {len(state['messages'])} message(s).")
@@ -136,7 +227,6 @@ def reasoner(state: AgentState) -> AgentState:
     tool_calls: Optional[List[Dict[str, Any]]] = None
 
     # Invoke the agent using its streaming interface.
-    # The agent_executor expects a dict with "messages" and a config.
     for chunk in AGENT_EXECUTOR.stream({"messages": state["messages"]}, AGENT_CONFIG):
         if "agent" in chunk:
             agent_msg = chunk["agent"]["messages"][0]
@@ -144,35 +234,58 @@ def reasoner(state: AgentState) -> AgentState:
         elif "tools" in chunk:
             tool_msg = chunk["tools"]["messages"][0]
             new_messages.append(tool_msg)
-            # Try to parse tool call instructions from the tool message.
             try:
                 parsed = json.loads(tool_msg.content)
-                # Expecting parsed to be a list of tool call dicts.
                 tool_calls = parsed
             except Exception as e:
-                # If parsing fails, wrap the content in a default tool call structure.
                 tool_calls = [{"tool": "cdp_tool", "input": tool_msg.content}]
-    next_action = "tools" if tool_calls else "end"
+
+    # Check if transaction requires human approval
+    requires_approval, amount, details = requires_human_approval(tool_calls) if tool_calls else (False, None, None)
+    
+    if requires_approval:
+        next_action = "human_approval"
+    else:
+        next_action = "tools" if tool_calls else "end"
+
     return {
         "messages": new_messages,
         "next_action": next_action,
         "tool_calls": tool_calls,
-        "iterations": iterations
+        "iterations": iterations,
+        "requires_approval": requires_approval,
+        "transaction_amount": amount,
+        "transaction_details": details
     }
 
 # ---------------- Graph Setup ----------------
 workflow = StateGraph(AgentState)
 workflow.add_node("reasoner", reasoner)
+workflow.add_node("human_approval", human_approval_node)
 workflow.add_node("tools", ToolNode(CDP_TOOLS))
+
+# Add conditional edges based on next_action
 workflow.add_conditional_edges(
     "reasoner",
     lambda state: state["next_action"],
     {
-        "tools": "tools",  # If tool_calls exist, route to the Tools node.
-        "end": END         # Otherwise, terminate.
+        "human_approval": "human_approval",  # Route to human approval if needed
+        "tools": "tools",                   # Route to tools if no approval needed
+        "end": END                          # End conversation
     }
 )
-workflow.add_edge("tools", "reasoner")  # After tool execution, return to the reasoner.
+
+# Add edges from human_approval node
+workflow.add_conditional_edges(
+    "human_approval",
+    lambda state: state["next_action"],
+    {
+        "tools": "tools",  # If approved, proceed to tools
+        "end": END        # If rejected, end conversation
+    }
+)
+
+workflow.add_edge("tools", "reasoner")  # After tool execution, return to the reasoner
 workflow.set_entry_point("reasoner")
 graph = workflow.compile()
 
@@ -186,7 +299,10 @@ def handle_user_input(agent_executor, user_input: str) -> str:
         "messages": [HumanMessage(content=user_input)],
         "next_action": None,
         "tool_calls": None,
-        "iterations": 0
+        "iterations": 0,
+        "requires_approval": False,
+        "transaction_amount": None,
+        "transaction_details": None
     }
     
     # Get all messages from the final state
