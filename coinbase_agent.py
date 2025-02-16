@@ -26,8 +26,9 @@ from cdp import *
 
 # ---------------- Configuration & Logging ----------------
 wallet_data_file = "wallet_data.txt"
-MAX_ITERATIONS = 5
-TIMEOUT = 30
+MAX_ITERATIONS = 3
+TIMEOUT = 15
+REQUEST_TIMEOUT = 20
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,7 +50,9 @@ def initialize_agent():
         model="gpt-3.5-turbo",
         api_key=api_key,
         timeout=TIMEOUT,
-        request_timeout=TIMEOUT
+        request_timeout=REQUEST_TIMEOUT,
+        max_retries=2,
+        temperature=0.7
     )
 
     wallet_data = None

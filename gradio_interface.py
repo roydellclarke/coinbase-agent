@@ -27,6 +27,9 @@ def chat_with_agent(message, history):
         logger.info(f"Processing message: {message}")
         # Process the user input through the agent
         response = handle_user_input(AGENT_EXECUTOR, message)
+        # Remove any duplicate lines that might occur in the response
+        response_lines = list(dict.fromkeys(response.split('\n')))
+        response = '\n'.join(response_lines)
         logger.info(f"Got response: {response}")
         
         # Stream the response character by character with a slight delay
@@ -56,13 +59,15 @@ Example commands:
         "Request test funds",
         "Deploy an NFT contract"
     ],
-    theme=gr.themes.Soft()
+    theme=gr.themes.Soft(),
+    concurrency_limit=5  # Limit concurrent requests
 )
 
 if __name__ == "__main__":
     logger.info("Starting Gradio interface...")
     demo.launch(
-        server_name="127.0.0.1",  # Use localhost instead of 0.0.0.0
-        share=False,  # Disable sharing
+        server_name="127.0.0.1",
+        server_port=7860,
+        share=False,
         show_api=False
     ) 
