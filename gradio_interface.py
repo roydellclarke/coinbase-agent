@@ -5,12 +5,16 @@ import logging
 import time
 import queue
 import threading
+from langchain.schema import HumanMessage, AIMessage
 
 # Load environment variables
 load_dotenv()
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Set up logging with more detail
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Initialize agent globally
@@ -34,33 +38,58 @@ def handle_transaction_approval(choice: str):
     return "Transaction decision recorded."
 
 def chat_with_agent(message, history):
-    """
-    Chat function for Gradio interface that uses the existing agent.
-    """
-    global current_transaction
-    
+    """Process user input through the agent and return the response."""
     try:
-        logger.info(f"Processing message: {message}")
-        response = handle_user_input(AGENT_EXECUTOR, message)
-        response_lines = list(dict.fromkeys(response.split('\n')))
-        response = '\n'.join(response_lines)
+        logger.info(f"Starting to process message: {message}")
         
-        # Check if this is a transaction approval request
-        if "TRANSACTION APPROVAL REQUIRED" in response:
-            current_transaction = response
-            # Create a more user-friendly approval message
-            approval_msg = (
-                "🚨 High-Value Transaction Detected 🚨\n"
-                f"A transaction exceeding ${TRANSACTION_THRESHOLD:,.2f} requires your approval.\n"
-                "Please use the 'Approve' or 'Reject' buttons below."
-            )
-            return approval_msg
+        # Single response accumulator
+        full_response = []
         
-        return response
-        
+        # Stream response from agent
+        logger.info("Starting to stream response from agent")
+        for chunk in handle_user_input(AGENT_EXECUTOR, message):
+            if not chunk:
+                logger.debug("Received empty chunk, skipping")
+                continue
+                
+            logger.info(f"Processing chunk: {chunk}")
+            
+            # Handle transaction approval specially
+            if "TRANSACTION APPROVAL REQUIRED" in chunk:
+                logger.info("Transaction approval required, returning approval message")
+                return (
+                    "🚨 High-Value Transaction Detected 🚨\n"
+                    f"A transaction exceeding ${TRANSACTION_THRESHOLD:,.2f} requires your approval.\n"
+                    "Please use the 'Approve' or 'Reject' buttons below."
+                )
+            
+            # Add new chunk to response
+            full_response.append(chunk)
+            
+        # Return final combined response
+        final_response = "\n".join(full_response) if full_response else "I apologize, but I wasn't able to process your request. Please try again."
+        logger.info(f"Returning final response: {final_response[:100]}...")  # Log first 100 chars
+        return final_response
+            
     except Exception as e:
-        logger.error(f"Error in chat: {str(e)}", exc_info=True)
+        logger.error(f"Error in chat_with_agent: {str(e)}", exc_info=True)
         return f"Error: {str(e)}"
+
+def respond(message, history):
+    """Combined function to handle both user input and bot response"""
+    if not message.strip():
+        return history
+        
+    try:
+        # Get complete response first
+        response = chat_with_agent(message, history)
+        
+        # Update history once with complete response
+        return history + [(message, response)]
+            
+    except Exception as e:
+        logger.error(f"Error in response: {e}", exc_info=True)
+        return history + [(message, f"Error: {str(e)}")]
 
 # Create Gradio interface
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
@@ -69,15 +98,36 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     
     **Note:** Transactions exceeding $1,000 require explicit approval.""")
     
-    chatbot = gr.ChatInterface(
-        fn=chat_with_agent,
+    chatbot = gr.Chatbot(
+        label="Chat History",
+        height=500,
+        show_copy_button=True,
+        bubble_full_width=False,
+        render_markdown=True
+    )
+    
+    with gr.Row():
+        msg = gr.Textbox(
+            label="Message",
+            placeholder="Type your message here...",
+            show_label=False,
+            container=True,
+            scale=8,
+            autofocus=True
+        )
+        submit = gr.Button("Send", variant="primary", scale=1)
+    
+    with gr.Row():
+        clear = gr.Button("Clear Chat")
+        
+    gr.Examples(
         examples=[
             "Create a new wallet",
             "Check my balance",
             "Request test funds",
-            "Send 1500 USDC to 0x742d35Cc6634C0532925a3b844Bc454e4438f44e"  # Example of high-value transaction
+            "Send 1500 USDC to 0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
         ],
-        title=""
+        inputs=msg
     )
     
     with gr.Row():
@@ -86,22 +136,44 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     
     transaction_status = gr.Textbox(label="Transaction Status", interactive=False)
     
+    # Handle message submission (both Enter key and Send button)
+    msg.submit(respond, [msg, chatbot], [chatbot], queue=True)
+    submit.click(respond, [msg, chatbot], [chatbot], queue=True)
+    
+    # Clear message box after sending
+    msg.submit(lambda: "", None, [msg], queue=False)
+    submit.click(lambda: "", None, [msg], queue=False)
+    
+    # Handle clear button
+    clear.click(lambda: [], None, chatbot, queue=False)
+    
     # Handle approval buttons
     approve_btn.click(
         fn=handle_transaction_approval,
         inputs=[gr.Textbox(value="approve", visible=False)],
-        outputs=transaction_status
+        outputs=transaction_status,
+        queue=True
     )
     reject_btn.click(
         fn=handle_transaction_approval,
         inputs=[gr.Textbox(value="reject", visible=False)],
-        outputs=transaction_status
+        outputs=transaction_status,
+        queue=True
     )
 
 if __name__ == "__main__":
-    logger.info("Starting Gradio interface...")
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
-        show_api=False
-    ) 
+    try:
+        logger.info("Starting Gradio interface...")
+        demo.queue()
+        logger.info("Queue initialized")
+        demo.launch(
+            server_name="127.0.0.1",
+            server_port=7860,
+            show_api=False,
+            share=False,
+            max_threads=5
+        )
+        logger.info("Gradio interface launched successfully")
+    except Exception as e:
+        logger.error(f"Failed to start Gradio interface: {str(e)}", exc_info=True)
+        raise 
